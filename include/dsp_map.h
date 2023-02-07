@@ -1,22 +1,6 @@
-/**************************************************************************
-
-Copyright <2022> <Gang Chen>
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-
-Author: Gang Chen
-
-Date: 2021/8/19
-
-Description: This is the head file for the DSP map with constant velocity model. In this file, Parameter ANGLE_RESOLUTION can be as small as the real sensor angle resolution. A (2*PYRAMID_NEIGHBOR_N+1)^2 neighborhood pyramid space will be considered in the update. This is ideal to handle occlusion when very tiny obstacles exist but is less efficient.
-
-**************************************************************************/
-
+//
+// Created by clarence on 2021/8/19.
+//
 
 #include <ctime>
 #include <cmath>
@@ -31,52 +15,27 @@ Description: This is the head file for the DSP map with constant velocity model.
 #include <pcl/segmentation/extract_clusters.h>
 #include <thread>
 #include "munkres.h"
-
-using namespace std;
-
-/** Parameters for the map **/
-#define MAP_LENGTH_VOXEL_NUM 50
-#define MAP_WIDTH_VOXEL_NUM 50
-#define MAP_HEIGHT_VOXEL_NUM 30
-#define VOXEL_RESOLUTION 0.2
-#define ANGLE_RESOLUTION 1
-#define PYRAMID_NEIGHBOR_N 2
-#define MAX_PARTICLE_NUM_VOXEL 30
-#define LIMIT_MOVEMENT_IN_XY_PLANE 1
-
-#define PREDICTION_TIMES 6
-static const float prediction_future_time[PREDICTION_TIMES] = {0.05f, 0.2f, 0.5f, 1.f, 1.5f, 2.f}; //unit: second. The first value is used to compensate the delay caused by the map.
-
-const int half_fov_h = 42;  // can be divided by ANGLE_RESOLUTION. If not, modify ANGLE_RESOLUTION or make half_fov_h a smaller value than the real FOV angle
-const int half_fov_v = 27;  // can be divided by ANGLE_RESOLUTION. If not, modify ANGLE_RESOLUTION or make half_fov_h a smaller value than the real FOV angle
-
-#define DYNAMIC_CLUSTER_MAX_POINT_NUM 200// Pre-velocity estimation parameter. Cluster with too many points will be allocated with a zero velocity.
-#define DYNAMIC_CLUSTER_MAX_CENTER_HEIGHT 1.5// Pre-velocity estimation parameter. Cluster with too high center will be allocated with a zero velocity.
-
-string particle_save_folder = ".";
-/** END **/
+#include "map_parameters.h"
 
 
 static const int observation_pyramid_num_h = (int)half_fov_h * 2 / ANGLE_RESOLUTION;
 static const int observation_pyramid_num_v = (int)half_fov_v * 2 / ANGLE_RESOLUTION;
 static const int observation_pyramid_num = observation_pyramid_num_h * observation_pyramid_num_v;
 
-static const int VOXEL_NUM = MAP_LENGTH_VOXEL_NUM*MAP_WIDTH_VOXEL_NUM*MAP_HEIGHT_VOXEL_NUM;
-static const int PYRAMID_NUM = 360*180/ANGLE_RESOLUTION/ANGLE_RESOLUTION;
 static const int SAFE_PARTICLE_NUM = VOXEL_NUM * MAX_PARTICLE_NUM_VOXEL + 1e5;
 static const int SAFE_PARTICLE_NUM_VOXEL = MAX_PARTICLE_NUM_VOXEL * 2;
 static const int SAFE_PARTICLE_NUM_PYRAMID = SAFE_PARTICLE_NUM/PYRAMID_NUM * 2;
 
 //An estimated number. If the observation points are too dense (over 100 points in one pyramid), the overflowed points will be ignored. It is suggested to use a voxel filter to the original point cloud.
 static const int observation_max_points_num_one_pyramid = 100;
+static const float obstacle_thickness_for_occlusion = 0.3;
 
-#define GAUSSIAN_RANDOMS_NUM 10000000
+//int velocity_estimation_error_occurred = 0;
+
+#define GAUSSIAN_RANDOMS_NUM 1000000
 
 #define O_MAKE_VALID 1       // use |= operator
 #define O_MAKE_INVALID  0    // use &= operator
-
-# define M_PIf32                3.14159265358979323846        /* pi */
-# define M_PI_2f32                1.57079632679489661923        /* pi/2 */
 
 using namespace std;
 
@@ -120,9 +79,8 @@ static float voxels_objects_number[VOXEL_NUM][voxels_objects_number_dimension];
 // 0.flag 1.particle voxel index  2.particle index inside voxel
 static int pyramids_in_fov[observation_pyramid_num][SAFE_PARTICLE_NUM_PYRAMID][3];
 
-// 1.neighbors num 2-:neighbor indexes
-static const int pyramid_neighbors_num = (2 * PYRAMID_NEIGHBOR_N + 1) * (2 * PYRAMID_NEIGHBOR_N + 1);
-static int observation_pyramid_neighbors[observation_pyramid_num][pyramid_neighbors_num+1]{};
+// 1.neighbors num 2-10:neighbor indexes
+static int observation_pyramid_neighbors[observation_pyramid_num][10]{};
 
 /// Variables for velocity estimation
 pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_in_current_view_rotated(new pcl::PointCloud<pcl::PointXYZ>());
@@ -135,23 +93,27 @@ pcl::PointCloud<pcl::PointXYZINormal>::Ptr input_cloud_with_velocity(new pcl::Po
 /** Storage for Gaussian randoms and Gaussian PDF**/
 static float p_gaussian_randoms[GAUSSIAN_RANDOMS_NUM];
 static float v_gaussian_randoms[GAUSSIAN_RANDOMS_NUM];
+static float localization_gaussian_randoms[GAUSSIAN_RANDOMS_NUM];
+
 static float standard_gaussian_pdf[20000];
 
 class DSPMap{
 public:
 
     DSPMap(int init_particle_num = 0, float init_weight=0.01f)
-            : voxel_num_x(MAP_LENGTH_VOXEL_NUM),  // oxel_resolution_set*voxel_num_x_set = map length
-              voxel_num_y(MAP_WIDTH_VOXEL_NUM),  // voxel_resolution_set*voxel_num_y_set = map width
-              voxel_num_z(MAP_HEIGHT_VOXEL_NUM),  // voxel_resolution_set*voxel_num_z_set = map height
+            : voxel_num_x(MAP_LENGTH_VOXEL_NUM),  /// Must be odd. voxel_resolution_set*voxel_num_x_set = map length
+              voxel_num_y(MAP_WIDTH_VOXEL_NUM),  /// Must be odd. voxel_resolution_set*voxel_num_y_set = map width
+              voxel_num_z(MAP_HEIGHT_VOXEL_NUM),  /// Must be odd. voxel_resolution_set*voxel_num_z_set = map height
               voxel_resolution(VOXEL_RESOLUTION),
-              angle_resolution(ANGLE_RESOLUTION),  // degree, should be completely divided by 360 degrees.
+              angle_resolution(ANGLE_RESOLUTION),  /// degree, should be completely divided by 360 degrees.
               max_particle_num_voxel(MAX_PARTICLE_NUM_VOXEL),
               velocity_gaussian_random_seq(0),
               position_gaussian_random_seq(0),
+              localization_gaussian_random_seq(0),
               position_prediction_stddev(0.2f),
               velocity_prediction_stddev(0.1f),
-              sigma_ob(0.2f),
+              sigma_observation(0.2f),
+              sigma_localization(0.f),
               kappa(0.01f),
               P_detection(0.95f),
               update_time(0.f),
@@ -246,16 +208,16 @@ public:
             float rotated_point_this[3];
             rotateVectorByQuaternion(&point_cloud_ptr[iter_num], sensor_rotation_quaternion, rotated_point_this);
 
+            // Store in pcl point cloud for velocity estimation of new born particles
+            pcl::PointXYZ p_this;
+            p_this.x = rotated_point_this[0];
+            p_this.y = rotated_point_this[1];
+            p_this.z = rotated_point_this[2];
+            cloud_in_current_view_rotated->push_back(p_this);
+
             // Store in pyramids for update
             if(ifInPyramidsArea(rotated_point_this[0], rotated_point_this[1], rotated_point_this[2]))
             {
-                // Store in pcl point cloud for velocity estimation of new born particles
-                pcl::PointXYZ p_this;
-                p_this.x = rotated_point_this[0];
-                p_this.y = rotated_point_this[1];
-                p_this.z = rotated_point_this[2];
-                cloud_in_current_view_rotated->push_back(p_this);
-
                 int pyramid_index_h, pyramid_index_v;
                 pyramid_index_h = findPointPyramidHorizontalIndex(rotated_point_this[0], rotated_point_this[1], rotated_point_this[2]);
                 pyramid_index_v = findPointPyramidVerticalIndex(rotated_point_this[0], rotated_point_this[1], rotated_point_this[2]);
@@ -278,7 +240,7 @@ public:
 
                 observation_num_each_pyramid[pyramid_index] += 1;
 
-                // Omit the overflowed observation points. It is suggested to used a voxel filter for the original input point clouds to avoid overflow.
+                // Omit the overflowed observation points. It is suggested to used a voxel filter on the input point clouds to avoid overflow.
                 if(observation_num_each_pyramid[pyramid_index] >= observation_max_points_num_one_pyramid){
                     observation_num_each_pyramid[pyramid_index] = observation_max_points_num_one_pyramid - 1;
                 }
@@ -297,32 +259,68 @@ public:
         std::thread velocity_estimation(velocityEstimationThread);
 
         /*** Prediction ***/
+//        clock_t start7, finish7;
+//        start7 = clock();
+
         mapPrediction(-odom_delt_px, -odom_delt_py, -odom_delt_pz, delt_t);  // Particles move in the opposite of the robot moving direction
+//
+//        finish7 = clock();
+//        double duration7= (double)(finish7 - start7) / CLOCKS_PER_SEC;
+//        printf( "****** Prediction time %f seconds\n", duration7 );
 
         /*** Update ***/
+//        clock_t start8, finish8;
+//        start8 = clock();
         if(point_cloud_num >= 0){
             mapUpdate();
         }else{
             cout << "No points to update." <<endl;
         }
 
+//        finish8 = clock();
+//        double duration8= (double)(finish8 - start8) / CLOCKS_PER_SEC;
+//        printf( "****** Update time %f seconds\n", duration8 );
 
-        /** Wait until initial velocity estimation is finished **/
+
+        /** Wait until optical flow calculation is finished **/
         velocity_estimation.join();
 
         /** Add updated new born particles ***/
+//        clock_t start1, finish1;
+//        start1 = clock();
 
         if(point_cloud_num >= 0){
             mapAddNewBornParticlesByObservation();
         }
 
+//        finish1 = clock();
+//        double duration1 = (double)(finish1 - start1) / CLOCKS_PER_SEC;
+//        printf( "****** new born time %f seconds\n", duration1);
 
         /** Calculate object number and Resample **/
-
+//        clock_t start9, finish9;
+//        start9 = clock();
         /// NOTE in this step the flag which is set to be 7.f in prediction step will be changed to 1.f or 0.6f.
         /// Removing this step will make prediction malfunction unless the flag is reset somewhere else.
         mapOccupancyCalculationAndResample();
 
+//        finish9 = clock();
+//        double duration9 = (double)(finish9 - start9) / CLOCKS_PER_SEC;
+//        printf( "****** Resample time %f seconds\n", duration9);
+
+
+        // finish11 = clock();
+        // double duration11= (double)(finish11 - start11) / CLOCKS_PER_SEC;
+        // printf( "****** Update time %f seconds\n", duration11 );
+
+        // total_time += duration11;
+        // ++ update_times;
+        // printf( "****** Average update time = %lf seconds\n", total_time / double(update_times));
+
+
+
+//        printf( "****** Total time %f seconds\n", duration1 + duration7 + duration8 + duration9 + duration11);
+//        printf("############################## \n \n");
 
         /*** Record particles for analysis  ***/
         static int recorded_once_flag = 0;
@@ -332,7 +330,7 @@ public:
                 recorded_once_flag = 1;
 
                 ofstream particle_log_writer;
-                string file_name = particle_save_folder + "particles_update_t_" + to_string(update_counter) + "_"+ to_string((int)(update_time*1000)) + ".csv";
+                string file_name = "/home/clarence/particles_update_t_" + to_string(update_counter) + "_"+ to_string((int)(update_time*1000)) + ".csv";
                 particle_log_writer.open(file_name, ios::out | ios::trunc);
 
                 for(int i=0; i<voxels_total_num; i++){
@@ -362,7 +360,22 @@ public:
     }
 
     void setObservationStdDev(float ob_stddev){
-        sigma_ob = ob_stddev;
+        sigma_observation = ob_stddev;
+        sigma_update = sigma_observation;
+
+        cout << "Observation stddev changed to " << sigma_observation << endl;
+    }
+
+    void setLocalizationStdDev(float lo_stddev){
+
+#if(CONSIDER_LOCALIZATION_UNCERTAINTY)
+        float tuned_scale_factor = 0.1f;
+        sigma_localization = lo_stddev*tuned_scale_factor;
+        cout << "Localization stddev changed to " << sigma_localization << endl;
+        // regenerate randoms
+        generateGaussianRandomsVectorZeroCenter();
+#endif
+
     }
 
     void setNewBornParticleWeight(float weight){
@@ -404,6 +417,29 @@ public:
     }
 
 
+    void getOccupancyMapWithVelocity(int &obstacles_num, std::vector<float> &weights, pcl::PointCloud<pcl::PointNormal> &cloud, const float threshold=0.7){
+        obstacles_num = 0;
+        for(int i=0; i<voxels_total_num; i++){
+            if(voxels_objects_number[i][0] > threshold){
+                pcl::PointNormal pcl_point;
+                pcl_point.normal_x = voxels_objects_number[i][1]; //vx
+                pcl_point.normal_y = voxels_objects_number[i][2]; //vy
+                pcl_point.normal_z = voxels_objects_number[i][3]; //vz
+                getVoxelPositionFromIndex(i, pcl_point.x, pcl_point.y, pcl_point.z);
+                cloud.push_back(pcl_point);
+                weights.push_back(voxels_objects_number[i][0]);
+                ++ obstacles_num;
+            }
+
+            /// Clear weights for next prediction
+            for(int j=4; j<voxels_objects_number_dimension; ++j)
+            {
+                voxels_objects_number[i][j] = 0.f;
+            }
+        }
+    }
+
+
     void getOccupancyMapWithFutureStatus(int &obstacles_num, pcl::PointCloud<pcl::PointXYZ> &cloud, float *future_status, const float threshold=0.7){
         obstacles_num = 0;
         for(int i=0; i<voxels_total_num; i++){
@@ -428,8 +464,36 @@ public:
     }
 
 
+    void getOccupancyMapWithRiskMaps(int &obstacles_num, pcl::PointCloud<pcl::PointXYZ> &cloud, float *risk_maps, const float threshold=0.7){
+        obstacles_num = 0;
+        for(int i=0; i<voxels_total_num; i++){
+            if(voxels_objects_number[i][0] > threshold){
+                pcl::PointXYZ pcl_point;
+                getVoxelPositionFromIndex(i, pcl_point.x, pcl_point.y, pcl_point.z);
+                cloud.push_back(pcl_point);
+
+                ++ obstacles_num;
+            }
+
+            for(int n=0; n < RISK_MAP_NUMBER; ++n){ // Set future weights
+                float temp_risk = 0.f;
+                for(int m=0; m < RISK_MAP_PREDICTION_TIMES; ++m){
+                    temp_risk += voxels_objects_number[i][4 + n*RISK_MAP_PREDICTION_TIMES +m];
+                }
+                *(risk_maps + i * RISK_MAP_NUMBER + n) = temp_risk;
+            }
+
+            /// Clear weights for next prediction
+            for(int j=4; j<voxels_objects_number_dimension; ++j)
+            {
+                voxels_objects_number[i][j] = 0.f;
+            }
+        }
+    }
+
+
     ///NOTE: If you don't want to use any visualization functions like "getOccupancyMap"
-    ///      or "getOccupancyMapWithFutureStatus", you must call this function after the update step.
+    ///      or "getOccupancyMapWithVelocity", you must call this function after update process.
     void clearOccupancyMapPrediction(){
         for(int i=0; i<voxels_total_num; i++){
             for(int j=4; j<voxels_objects_number_dimension; ++j)
@@ -474,7 +538,9 @@ private:
     float position_prediction_stddev;
     float velocity_prediction_stddev;
 
-    float sigma_ob;
+    float sigma_observation;
+    float sigma_localization;
+    float sigma_update;
 
     float P_detection;
 
@@ -483,6 +549,7 @@ private:
 
     /** Variables **/
     int position_gaussian_random_seq;
+    int localization_gaussian_random_seq;
     int velocity_gaussian_random_seq;
 
     float kappa;
@@ -527,6 +594,8 @@ private:
     void setInitParameters(){
 
         /*** Set parameters **/
+        sigma_update = sigma_observation;
+
         map_length_x_half = (voxel_resolution* (float)voxel_num_x) * 0.5f;
         map_length_y_half = (voxel_resolution* (float)voxel_num_y) * 0.5f;
         map_length_z_half = (voxel_resolution* (float)voxel_num_z) * 0.5f;
@@ -621,6 +690,8 @@ private:
             }
         }
 
+//        cout << "successfully_added_num="<<successfully_added_num<<endl;
+//        cout << "voxel_overflow_num="<<voxel_overflow_num<<endl;
     }
 
 
@@ -662,9 +733,18 @@ private:
                     voxels_with_particle[v_index][p][3] = 0.f;
 #endif
 
+
+
+#if(CONSIDER_LOCALIZATION_UNCERTAINTY)
+                    voxels_with_particle[v_index][p][4] += delt_t*voxels_with_particle[v_index][p][1] + odom_delt_px + getLocalizationGaussianZeroCenter();
+                    voxels_with_particle[v_index][p][5] += delt_t*voxels_with_particle[v_index][p][2] + odom_delt_py + getLocalizationGaussianZeroCenter();
+                    voxels_with_particle[v_index][p][6] += delt_t*voxels_with_particle[v_index][p][3] + odom_delt_pz + getLocalizationGaussianZeroCenter();
+#else
                     voxels_with_particle[v_index][p][4] += delt_t*voxels_with_particle[v_index][p][1] + odom_delt_px;  //px
                     voxels_with_particle[v_index][p][5] += delt_t*voxels_with_particle[v_index][p][2] + odom_delt_py;  //py
                     voxels_with_particle[v_index][p][6] += delt_t*voxels_with_particle[v_index][p][3] + odom_delt_pz;  //pz
+#endif
+
 
                     int particle_voxel_index_new;
                     if(getParticleVoxelsIndex(voxels_with_particle[v_index][p][4], voxels_with_particle[v_index][p][5],
@@ -692,6 +772,12 @@ private:
                 }
             }
         }
+
+//        cout << "exist_particles=" << exist_particles<<endl;
+//        cout << "voxel_full_remove_counter="<<voxel_full_remove_counter<<endl;
+//        cout << "pyramid_full_remove_counter="<<pyramid_full_remove_counter<<endl;
+//        cout << "moves_out_counter="<<moves_out_counter<<endl;
+//        cout << "operation_counter_prediction="<<operation_counter<<endl;
 
         if(moves_out_counter > 10000){
             cout <<"!!!!! An error occured! delt_t = " << delt_t <<endl;
@@ -721,13 +807,13 @@ private:
 
                             float gk = queryNormalPDF(
                                     voxels_with_particle[particle_voxel_index][particle_voxel_inner_index][4],
-                                    point_cloud[i][j][0], sigma_ob)
+                                    point_cloud[i][j][0], sigma_update)
                                        * queryNormalPDF(
                                     voxels_with_particle[particle_voxel_index][particle_voxel_inner_index][5],
-                                    point_cloud[i][j][1], sigma_ob)
+                                    point_cloud[i][j][1], sigma_update)
                                        * queryNormalPDF(
                                     voxels_with_particle[particle_voxel_index][particle_voxel_inner_index][6],
-                                    point_cloud[i][j][2], sigma_ob);
+                                    point_cloud[i][j][2], sigma_update);
 
                             point_cloud[i][j][3] += P_detection * voxels_with_particle[particle_voxel_index][particle_voxel_inner_index][7] * gk;
                         }
@@ -758,7 +844,7 @@ private:
                     float pz_this = voxels_with_particle[particle_voxel_index][particle_voxel_inner_index][6];
                     float particle_dist_length = sqrtf(px_this*px_this + py_this*py_this + pz_this*pz_this);
 
-                    if(point_cloud_max_length[i] > 0.f && particle_dist_length > point_cloud_max_length[i] + voxel_resolution) //Update only particles that are not occluded, use voxel_resolution as the distance metric.
+                    if(point_cloud_max_length[i] > 0.f && particle_dist_length > point_cloud_max_length[i] + obstacle_thickness_for_occlusion) //Update only particles that are not occluded, use voxel_resolution as the distance metric.
                     {
                         // occluded
                         continue;
@@ -772,9 +858,9 @@ private:
 
                         for(int z_seq=0; z_seq<observation_num_each_pyramid[neighbor_index]; ++z_seq) //for all observation points in a neighbor pyramid
                         {
-                            float gk = queryNormalPDF(px_this, point_cloud[neighbor_index][z_seq][0], sigma_ob)
-                                       * queryNormalPDF(py_this, point_cloud[neighbor_index][z_seq][1], sigma_ob)
-                                       * queryNormalPDF(pz_this, point_cloud[neighbor_index][z_seq][2], sigma_ob);
+                            float gk = queryNormalPDF(px_this, point_cloud[neighbor_index][z_seq][0], sigma_update)
+                                       * queryNormalPDF(py_this, point_cloud[neighbor_index][z_seq][1], sigma_update)
+                                       * queryNormalPDF(pz_this, point_cloud[neighbor_index][z_seq][2], sigma_update);
 
                             sum_by_zk += P_detection * gk / point_cloud[neighbor_index][z_seq][3];
                             ++operation_counter_update;
@@ -1054,10 +1140,24 @@ private:
 
         }
 
+//        // Resampling result analysis
+//        int particle_num_after_resampling = 0;
+//
+//        for(int v_index=0; v_index<VOXEL_NUM; ++v_index)
+//        {
+//            for(int i=0; i<SAFE_PARTICLE_NUM_VOXEL; i++){
+//                if(voxels_with_particle[v_index][i][0] > 0.1f){
+//                    ++ particle_num_after_resampling;
+//                }
+//            }
+//        }
+//        cout <<"particle_num_after_resampling_should_be="<<particle_num_after_resampling_should_be<<endl;
+//        cout <<"particle_num_after_resampling="<<particle_num_after_resampling<<endl;
+//        cout <<"removed_particle_counter="<<removed_particle_counter<<endl;
     }
 
 
-private:
+private: /*** Some specific functions ***/
 
     int getParticleVoxelsIndex(const Particle &p, int &index){
         if(ifParticleIsOut(p)){return 0;}
@@ -1132,8 +1232,8 @@ private:
 
         neighbor_spaces_num = 0;
 
-        for(int i=-PYRAMID_NEIGHBOR_N ; i <= PYRAMID_NEIGHBOR_N; ++i){
-            for(int j=-PYRAMID_NEIGHBOR_N; j <= PYRAMID_NEIGHBOR_N; ++j){
+        for(int i=-1; i<=1; ++i){
+            for(int j=-1; j<=1; ++j){
                 int h = h_index_ori + i;
                 int v = v_index_ori + j;
                 if(h>=0 && h<observation_pyramid_num_h && v>=0 && v<observation_pyramid_num_v)
@@ -1149,12 +1249,14 @@ private:
 
     void generateGaussianRandomsVectorZeroCenter() const{
         std::default_random_engine random(time(NULL));
-        std::normal_distribution<double> n1(0, position_prediction_stddev);
-        std::normal_distribution<double> n2(0, velocity_prediction_stddev);
+        std::normal_distribution<float> n1(0, position_prediction_stddev);
+        std::normal_distribution<float> n2(0, velocity_prediction_stddev);
+        std::normal_distribution<float> n3(0, sigma_localization);
 
         for(int i=0; i<GAUSSIAN_RANDOMS_NUM; i++){
             *(p_gaussian_randoms+i) = n1(random);
             *(v_gaussian_randoms+i) = n2(random);
+            *(localization_gaussian_randoms+i) = n3(random);
         }
 
     }
@@ -1164,6 +1266,16 @@ private:
         position_gaussian_random_seq += 1;
         if(position_gaussian_random_seq >= GAUSSIAN_RANDOMS_NUM){
             position_gaussian_random_seq = 0;
+        }
+        return delt_p;
+    }
+
+
+    float getLocalizationGaussianZeroCenter(){
+        float delt_p = localization_gaussian_randoms[localization_gaussian_random_seq];
+        localization_gaussian_random_seq += 1;
+        if(localization_gaussian_random_seq >= GAUSSIAN_RANDOMS_NUM){
+            localization_gaussian_random_seq = 0;
         }
         return delt_p;
     }
@@ -1325,9 +1437,14 @@ private:
         return x1*x2 + y1*y2 + z1*z2;
     }
 
+//    static void vectorCOut(float *a){
+//        cout<<"("<< *a <<","<< *(a+1)<<","<< *(a+2)<<") ";
+//    }
 
     int ifInPyramidsArea(float &x, float &y, float &z)
     {
+//        vectorCOut(&pyramid_BPnorm_params_v[observation_pyramid_num_v][0]);
+
         if(vectorMultiply(x,y,z, pyramid_BPnorm_params_h[0][0], pyramid_BPnorm_params_h[0][1], pyramid_BPnorm_params_h[0][2]) >= 0.f
           && vectorMultiply(x,y,z, pyramid_BPnorm_params_h[observation_pyramid_num_h][0], pyramid_BPnorm_params_h[observation_pyramid_num_h][1], pyramid_BPnorm_params_h[observation_pyramid_num_h][2]) <= 0.f
           && vectorMultiply(x,y,z, pyramid_BPnorm_params_v[0][0], pyramid_BPnorm_params_v[0][1], pyramid_BPnorm_params_v[0][2]) <= 0.f
@@ -1433,7 +1550,7 @@ private:
                 cluster_this.center_y /= (float)cluster_this.point_num;
                 cluster_this.center_z /= (float)cluster_this.point_num;
 
-                if(cluster_indice.indices.size() > DYNAMIC_CLUSTER_MAX_POINT_NUM || cluster_this.center_z > DYNAMIC_CLUSTER_MAX_CENTER_HEIGHT){ //filter static points  //400, 1.5
+                if(cluster_indice.indices.size() > 150 || cluster_this.center_z > 1.4){ //filter static points  //400, 1.5
                     // Static
                     for (int indice : cluster_indice.indices){
                         static_points->push_back((*non_ground_points)[indice]);
