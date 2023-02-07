@@ -36,4 +36,5 @@ set(MunkresLIB
 add_executable(map_sim_example src/map_sim_example.cpp)
 target_link_libraries(map_sim_example ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${MunkresLIB})
 
-
+add_executable(mapping src/mapping.cpp)
+target_link_libraries(mapping ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${MunkresLIB})
